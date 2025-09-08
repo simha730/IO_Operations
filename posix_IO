@@ -1,0 +1,141 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <unistd.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <time.h>
+#include <aio.h>
+#include <string.h>
+
+static inline long long timespec_to_ns(const struct timespec *t) {
+    return (long long)t->tv_sec * 1000000000LL + t->tv_nsec;
+}
+
+int main(int argc, char **argv) {
+    char *fileName = "posixio.bin";
+    size_t write_size = 4096;   // block size
+    size_t total_mb   = 64;     // total size in MB
+    size_t queue_depth = 16;    // default inflight requests
+
+    if (argc >= 2) fileName = argv[1];
+    if (argc >= 3) write_size = (size_t)strtoull(argv[2], NULL, 10);
+    if (argc >= 4) total_mb   = (size_t)strtoull(argv[3], NULL, 10);
+    if (argc >= 5) queue_depth = (size_t)strtoull(argv[4], NULL, 10);
+
+    size_t iterations = (total_mb * 1024ULL * 1024ULL) / write_size;
+    if (iterations == 0) {
+        fprintf(stderr, "Bad args: too few iterations\n");
+        return 1;
+    }
+
+    int fd = open(fileName, O_CREAT | O_WRONLY | O_TRUNC, 0664);
+    if (fd < 0) {
+        perror("open");
+        return 1;
+    }
+
+    void *buffer;
+    if (posix_memalign(&buffer, 4096, write_size)) {
+        perror("posix_memalign");
+        return 1;
+    }
+
+    // fill buffer with pattern
+    for (size_t i = 0; i < write_size; i++) {
+        ((unsigned char *)buffer)[i] = (unsigned char)(i & 0xFF);
+    }
+
+    struct aiocb *cbs = calloc(queue_depth, sizeof(struct aiocb));
+    if (!cbs) {
+        perror("calloc");
+        return 1;
+    }
+
+    printf("POSIX AIO demo :: total=%zu MB, block=%zu bytes, ops=%zu, qd=%zu\n",
+           total_mb, write_size, iterations, queue_depth);
+
+    struct timespec tstart, tend;
+    clock_gettime(CLOCK_MONOTONIC, &tstart);
+
+    long long min_ns = (1LL << 62), max_ns = 0, sum_ns = 0;
+
+    size_t submitted = 0, completed = 0;
+
+    while (completed < iterations) {
+        // submit up to queue depth
+        while (submitted < iterations && (submitted - completed) < queue_depth) {
+            struct aiocb *cb = &cbs[submitted % queue_depth];
+            memset(cb, 0, sizeof(*cb));
+            cb->aio_fildes = fd;
+            cb->aio_buf = buffer;
+            cb->aio_nbytes = write_size;
+            cb->aio_offset = submitted * write_size;
+
+            if (aio_write(cb) < 0) {
+                perror("aio_write");
+                return 1;
+            }
+            submitted++;
+        }
+
+        // wait for at least one to finish
+        const struct aiocb *list[queue_depth];
+        size_t inflight = submitted - completed;
+        for (size_t i = 0; i < inflight; i++) {
+            list[i] = &cbs[(completed + i) % queue_depth];
+        }
+
+        if (aio_suspend(list, inflight, NULL) < 0) {
+            perror("aio_suspend");
+            return 1;
+        }
+
+        // check completions
+        for (size_t i = 0; i < inflight; i++) {
+            struct aiocb *cb = (struct aiocb *)list[i];
+            int err = aio_error(cb);
+            if (err == EINPROGRESS) continue; // still running
+
+            if (err != 0) {
+                fprintf(stderr, "aio_error: %s\n", strerror(err));
+                return 1;
+            }
+
+            ssize_t ret = aio_return(cb);
+            if (ret != (ssize_t)write_size) {
+                fprintf(stderr, "short write: %zd\n", ret);
+                return 1;
+            }
+
+            // measure latency per op (optional: approximate)
+            struct timespec tend_op;
+            clock_gettime(CLOCK_MONOTONIC, &tend_op);
+            long long ns = timespec_to_ns(&tend_op) - timespec_to_ns(&tstart); 
+            sum_ns += ns;
+            if (ns < min_ns) min_ns = ns;
+            if (ns > max_ns) max_ns = ns;
+
+            completed++;
+        }
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &tend);
+
+    long long elapsed_ns = timespec_to_ns(&tend) - timespec_to_ns(&tstart);
+    double elapsed_s = (double)elapsed_ns / 1e9;
+    double throughput = (double)(iterations * write_size) / (1024.0 * 1024.0) / elapsed_s;
+
+    long long avg_ns = sum_ns / iterations;
+
+    printf("Total time: %.3f s, Throughput: %.2f MB/s\n", elapsed_s, throughput);
+    printf("Latency avg: %lld ns, min: %.6f s, max: %.6f s\n",
+           avg_ns, min_ns / 1e9, max_ns / 1e9);
+
+    free(cbs);
+    free(buffer);
+    close(fd);
+    return 0;
+}
